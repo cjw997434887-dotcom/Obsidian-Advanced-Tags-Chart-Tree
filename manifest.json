@@ -1,11 +1,11 @@
 {
 	"id": "Advanced Tags Chart Tree",
 	"name": "Advanced Tags Chart Tree",
-	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
+	"version": "2.0.0",
+	"minAppVersion": "1.0.0",
 	"description": "An enhanced version of the official Obsidian tags panel built based on ChatGPT.",
 	"author": "JweiChen",
-	"authorUrl": "https://github.com/cjw997434887-dotcom",
-	"fundingUrl": "https://github.com/cjw997434887-dotcom/Obsidian-Advanced-Tags-Chart-Tree",
+	"authorUrl": "https://github.com/JiaWei-Git",
+	"fundingUrl": "https://github.com/JiaWei-Git/Obsidian-Advanced-Tags-Chart-Tree",
 	"isDesktopOnly": true
 }
