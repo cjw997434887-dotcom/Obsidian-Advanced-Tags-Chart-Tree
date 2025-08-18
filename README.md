@@ -1,4 +1,4 @@
-# Tag Tree — Obsidian Plugin (Inner-test 1.0)
+# Tag Tree — Obsidian Plugin
 
 > A beautiful, animated, high-performance tag tree panel for Obsidian — tag counts, hierarchical tags, left-aligned overlay bars, smooth expand/collapse animations, and efficient hot-update (frontmatter + inline tags).
 > Designed for power users who want a visual, compact and configurable tag overview.

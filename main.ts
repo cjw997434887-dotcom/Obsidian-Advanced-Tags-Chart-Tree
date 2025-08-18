@@ -1,5 +1,8 @@
 // main.ts
-import { App, ItemView, Plugin, WorkspaceLeaf, PluginSettingTab, Setting, TFile } from "obsidian";
+// Obsidian 插件：Advanced Tags Chart Tree - main
+// 说明：基于“基础版1.0”，恢复/优化动画预热、拖拽即插入（#tag 文本）、任意输入框/ contenteditable 支持、设置界面排版
+
+import { App, ItemView, Plugin, WorkspaceLeaf, PluginSettingTab, Setting, TFile, MarkdownView } from "obsidian";
 
 const VIEW_TYPE_TAG_TREE = "tag-tree-view";
 
@@ -9,37 +12,47 @@ interface TagNode {
   count: number;
   children: Map<string, TagNode>;
   expanded: boolean;
+  lastUsed?: number;
 }
 
 interface Settings {
-  idleTimeout: number;
-  activeBarOpacity: number;
-  idleBarAlpha: number;
-  expandDuration: number;
-  expandEasing: string;
-  maxBarWidth: number;
-  barAnimationDuration: number;
-  barFadeDuration: number;
-  subTagIndent: number;
-  sidePadding: number;
-  metadataDebounceMs: number;
+  // 基础与动画设置（中文注释将显示在设置页）
+  idleTimeout: number; // 进入空闲状态的无操作时长（毫秒）
+  activeBarOpacity: number; // 活动状态下背景条的不透明度
+  idleBarAlpha: number; // 空闲时背景条不透明度
+  expandDuration: number; // 子列表高度展开/收起动画时长 (ms)
+  expandEasing: string; // 高度动画缓动曲线
+  maxBarWidth: number; // 背景条最大宽度（像素）
+  barAnimationDuration: number; // 背景条整体动画时长（ms）
+  barFadeDuration: number; // 背景条渐显/渐隐时长（ms）
+  subTagIndent: number; // 子标签文本缩进距离（像素）
+  sidePadding: number; // 面板左右内边距（像素）
 
+  // 横向动画与分段控制（可单独设置）
   barExpandDuration: number;
   barCollapseDuration: number;
   barFadeInDuration: number;
   barFadeOutDuration: number;
+  barPreheatExpandMs: number; // 展开预热时间（ms）
+  barPreheatCollapseMs: number; // 收起预热时间（ms）
 
+  // 色彩与呈现
   barColor0: string;
   barColor1: string;
   barColor2: string;
   barColor3: string;
+  barCornerRadius: number;
 
+  // 其他
   rightPadding: number;
-  frontmatterReadDelay: number;
-  barPreheatExpandMs: number;
-  barPreheatCollapseMs: number;
 
-  barCornerRadius: number; // 新增：背景条圆角（px）
+  // 排序
+  sortBy: "count" | "latest";
+  sortOrder: "desc" | "asc";
+
+  // 热更新 debounce 等
+  metadataDebounceMs: number;
+  frontmatterReadDelay: number;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -47,30 +60,33 @@ const DEFAULT_SETTINGS: Settings = {
   activeBarOpacity: 0.30,
   idleBarAlpha: 0.95,
   expandDuration: 320,
-  expandEasing: "cubic-bezier(0.2, 0.8, 0.2, 1)",
-  maxBarWidth: 150,
+  expandEasing: "cubic-bezier(0.2,0.8,0.2,1)",
+  maxBarWidth: 300,
   barAnimationDuration: 320,
   barFadeDuration: 200,
-  subTagIndent: 9,
+  subTagIndent: 12,
   sidePadding: 16,
-  metadataDebounceMs: 40,
 
-  barExpandDuration: 240,
-  barCollapseDuration: 200,
+  barExpandDuration: 260,
+  barCollapseDuration: 220,
   barFadeInDuration: 160,
-  barFadeOutDuration: 120,
+  barFadeOutDuration: 140,
+  barPreheatExpandMs: 100,
+  barPreheatCollapseMs: 80,
 
   barColor0: "#9BE9A8",
   barColor1: "#40C463",
   barColor2: "#30A14E",
   barColor3: "#216E39",
+  barCornerRadius: 4,
 
   rightPadding: 12,
-  frontmatterReadDelay: 80,
-  barPreheatExpandMs: 80,
-  barPreheatCollapseMs: 40,
 
-  barCornerRadius: 3,
+  sortBy: "count",
+  sortOrder: "desc",
+
+  metadataDebounceMs: 40,
+  frontmatterReadDelay: 80,
 };
 
 export default class TagTreePlugin extends Plugin {
@@ -78,6 +94,7 @@ export default class TagTreePlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+
     this.registerView(VIEW_TYPE_TAG_TREE, (leaf: WorkspaceLeaf) => new TagTreeView(leaf, this.app, this.settings));
 
     this.addCommand({
@@ -86,7 +103,7 @@ export default class TagTreePlugin extends Plugin {
       callback: () => {
         this.app.workspace.detachLeavesOfType(VIEW_TYPE_TAG_TREE);
         let leaf = this.app.workspace.getRightLeaf(false);
-        if (leaf == null) leaf = this.app.workspace.getLeaf(true);
+        if (!leaf) leaf = this.app.workspace.getLeaf(true);
         leaf.setViewState({ type: VIEW_TYPE_TAG_TREE, active: true });
         this.app.workspace.revealLeaf(leaf);
       },
@@ -94,31 +111,36 @@ export default class TagTreePlugin extends Plugin {
 
     this.addSettingTab(new TagTreeSettingTab(this.app, this));
 
+    // 插入样式
     const style = document.createElement("style");
     style.id = "tag-tree-plugin-style";
     style.textContent = `
-      .tag-tree-view-container { transition: color 1s ease; color: inherit; background-color: transparent; height:100%; overflow-y:auto; box-sizing:border-box; font-size:13px; user-select:none; }
+      /* 面板主样式 */
+      .tag-tree-view-container { transition: color 1s ease; color: inherit; background-color: transparent; height:100%; overflow:auto; box-sizing:border-box; font-size:13px; }
       .tag-tree-view-container.idle { color: transparent !important; }
 
-      ul.tag-tree-ul { list-style:none; padding-left:0 !important; margin-left:0 !important; }
-      li.tag-tree-li { position:relative; padding-left:18px; margin-bottom:6px; height:22px; line-height:22px; z-index:3; }
+      ul.tag-tree-ul { list-style:none; padding-left:0; margin:0; }
+      li.tag-tree-li { position:relative; padding-left:18px; margin-bottom:6px; height:24px; line-height:24px; z-index:3; }
 
-      .tag-tree-view-arrow { display:inline-block; width:16px; position:absolute; left:0; top:50%; transform:translateY(-50%); cursor:pointer; user-select:none; transition: color 0.2s ease; z-index:6; }
-      .tag-tree-view-arrow svg { display:block; width:12px; height:12px; transition: transform 220ms var(--easing, cubic-bezier(0.2,0.8,0.2,1)); transform-origin:center; }
-      .tag-tree-view-arrow.expanded svg { transform: rotate(90deg); }
+      .tag-tree-view-arrow { position:absolute; left:0; top:50%; transform:translateY(-50%); width:16px; cursor:pointer; z-index:6; transition: transform 220ms var(--easing); }
+      .tag-tree-view-arrow svg { display:block; width:12px; height:12px; }
+      .tag-tree-view-arrow.expanded { transform: translateY(-50%) rotate(90deg); }
 
-      .tag-tree-view-flex-container { display:flex; justify-content:space-between; align-items:center; position:relative; z-index:7; color:inherit; user-select:text; height:22px; }
-      .tag-tree-view-flex-container .tag-name { cursor:pointer; }
-      .tag-tree-view-count { flex:0 0 48px; text-align:right; color:var(--text-muted); padding-left:8px; }
+      .tag-tree-view-flex-container { display:flex; justify-content:space-between; align-items:center; position:relative; z-index:7; color:inherit; user-select:text; height:24px; padding-left:0; }
+      .tag-tree-name { cursor:pointer; user-select:none; }
+      .tag-tree-count { flex:0 0 48px; text-align:right; color:var(--text-muted); padding-left:8px; }
 
       .tag-tree-bar-overlay { position:absolute; inset:0; pointer-events:none; z-index:1; }
-      .tag-tree-view-bg-bar { position:absolute; height:22px; pointer-events:none; overflow:hidden; will-change:left,transform,width,opacity; }
-      .tag-tree-view-bg-bar .bar-inner { position:absolute; left:0; top:0; bottom:0; right:0; transform-origin:left center; will-change:transform,opacity,background-color; }
+      .tag-tree-view-bg-bar { position:absolute; height:24px; pointer-events:none; overflow:hidden; transform-origin:left center; }
+      .tag-tree-view-bg-bar .bar-inner { position:absolute; left:0; right:0; top:0; bottom:0; transform-origin:left center; }
 
-      ul.tag-tree-children { list-style:none; padding-left:0 !important; margin-left:0 !important; overflow:hidden; max-height:0; opacity:0; transition-property:max-height,opacity; }
+      ul.tag-tree-children { list-style:none; padding-left:0; margin-left:0; overflow:hidden; max-height:0; opacity:0; transition-property:max-height,opacity; }
 
-      .tag-tree-settings-hr { height:1px; border:none; margin:12px 0; background-color: var(--interactive-accent, var(--accent, #40C463)); opacity:0.12; }
-      .tag-tree-settings-group-title { margin: 6px 0 8px 0; font-weight:600; font-size:13px; color: var(--text-normal); }
+      /* 设置页样式：更精简高级 */
+      .tag-tree-settings-hr { height:1px; border:none; margin:12px 0; background-color: var(--interactive-accent, var(--accent)); opacity:0.12; }
+      .tag-tree-settings-group-title { margin:6px 0 8px 0; font-weight:600; font-size:13px; color:var(--text-normal); }
+
+      .tag-tree-dragging { opacity:0.85; }
     `;
     document.head.appendChild(style);
   }
@@ -136,133 +158,80 @@ export default class TagTreePlugin extends Plugin {
   async saveSettings() { await this.saveData(this.settings); }
 }
 
-/* Settings Tab（重构分组与排版） */
+/* 设置页（分组、中文注释） */
 class TagTreeSettingTab extends PluginSettingTab {
   plugin: TagTreePlugin;
   constructor(app: App, plugin: TagTreePlugin) { super(app, plugin); this.plugin = plugin; }
 
-  private hr(container: HTMLElement) { container.createEl("hr", { cls: "tag-tree-settings-hr" }); }
-
   display(): void {
     const { containerEl } = this;
+
     containerEl.empty();
-    containerEl.createEl("h3", { text: "标签树设置" });
+    containerEl.createEl("h2", { text: "Advanced Tags - 设置", cls: "tag-tree-settings-title" });
 
-    // ===== Heat Update（热更新） =====
-    containerEl.createEl("div", { text: "热更新（Heat Update）", cls: "tag-tree-settings-group-title" });
-    new Setting(containerEl).setName("Metadata debounce (ms)")
-      .setDesc("处理 metadata 变更时的防抖时间（毫秒），较小值更实时但会增加处理频率。")
+    // 热更新设置组
+    containerEl.createEl("div", { text: "热更新 (Hot update)", cls: "tag-tree-settings-group-title" });
+    new Setting(containerEl).setName("Metadata debounce (ms)").setDesc("处理 metadata 变更时的防抖时间，越低响应越快但 CPU 占用可能上升（默认 40ms）")
       .addText(t => t.setValue(String(this.plugin.settings.metadataDebounceMs)).onChange(async v => { this.plugin.settings.metadataDebounceMs = Number(v) || DEFAULT_SETTINGS.metadataDebounceMs; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Frontmatter read delay (ms)")
-      .setDesc("当 cache 未包含 frontmatter 时，延迟读取文件内容解析 frontmatter（毫秒）。")
+    new Setting(containerEl).setName("Frontmatter read delay (ms)").setDesc("当缓存缺失 frontmatter 时，读取文件内容解析 frontmatter 的延迟（默认 80ms）")
       .addText(t => t.setValue(String(this.plugin.settings.frontmatterReadDelay)).onChange(async v => { this.plugin.settings.frontmatterReadDelay = Number(v) || DEFAULT_SETTINGS.frontmatterReadDelay; await this.plugin.saveSettings(); }));
 
-    this.hr(containerEl);
+    containerEl.createEl("hr", { cls: "tag-tree-settings-hr" });
 
-    // ===== Animation（动画效果） =====
-    containerEl.createEl("div", { text: "动画（Animation）", cls: "tag-tree-settings-group-title" });
-
-    new Setting(containerEl).setName("Slide duration (ms)")
-      .setDesc("展开/收起子列表时的高度动画时长（毫秒）。")
+    // 动画设置组
+    containerEl.createEl("div", { text: "动画 (Animation)", cls: "tag-tree-settings-group-title" });
+    new Setting(containerEl).setName("Slide duration (ms)").setDesc("展开/收起子列表的高度动画时长")
       .addText(t => t.setValue(String(this.plugin.settings.expandDuration)).onChange(async v => { this.plugin.settings.expandDuration = Number(v) || DEFAULT_SETTINGS.expandDuration; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Slide easing")
-      .setDesc("展开/收起高度动画的缓动曲线（cubic-bezier 或关键字）。")
+    new Setting(containerEl).setName("Slide easing").setDesc("高度动画缓动曲线 (CSS)")
       .addText(t => t.setValue(this.plugin.settings.expandEasing).onChange(async v => { this.plugin.settings.expandEasing = v || DEFAULT_SETTINGS.expandEasing; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Bar expand (ms)")
-      .setDesc("背景条横向伸展动画时长（毫秒）。")
+    new Setting(containerEl).setName("Bar expand (ms)").setDesc("背景条横向伸展时间")
       .addText(t => t.setValue(String(this.plugin.settings.barExpandDuration)).onChange(async v => { this.plugin.settings.barExpandDuration = Number(v) || DEFAULT_SETTINGS.barExpandDuration; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Bar collapse (ms)")
-      .setDesc("背景条横向收缩动画时长（毫秒）。")
+    new Setting(containerEl).setName("Bar collapse (ms)").setDesc("背景条横向收缩时间")
       .addText(t => t.setValue(String(this.plugin.settings.barCollapseDuration)).onChange(async v => { this.plugin.settings.barCollapseDuration = Number(v) || DEFAULT_SETTINGS.barCollapseDuration; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Bar fade in (ms)")
-      .setDesc("背景条渐显动画时长（毫秒）。")
-      .addText(t => t.setValue(String(this.plugin.settings.barFadeInDuration)).onChange(async v => { this.plugin.settings.barFadeInDuration = Number(v) || DEFAULT_SETTINGS.barFadeInDuration; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Bar fade out (ms)")
-      .setDesc("背景条渐隐动画时长（毫秒）。")
-      .addText(t => t.setValue(String(this.plugin.settings.barFadeOutDuration)).onChange(async v => { this.plugin.settings.barFadeOutDuration = Number(v) || DEFAULT_SETTINGS.barFadeOutDuration; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Bar preheat (expand, ms)")
-      .setDesc("展开时，背景条提前启动（毫秒），用于高度动画与背景条的连贯性。")
+    new Setting(containerEl).setName("Bar preheat expand (ms)").setDesc("展开时背景条预热时间（会让条在高度动画前准备就绪）")
       .addText(t => t.setValue(String(this.plugin.settings.barPreheatExpandMs)).onChange(async v => { this.plugin.settings.barPreheatExpandMs = Number(v) || DEFAULT_SETTINGS.barPreheatExpandMs; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Bar preheat (collapse, ms)")
-      .setDesc("收起时的预热设置（毫秒）。")
+    new Setting(containerEl).setName("Bar preheat collapse (ms)").setDesc("收起时背景条预热时间（收缩先于高度折叠）")
       .addText(t => t.setValue(String(this.plugin.settings.barPreheatCollapseMs)).onChange(async v => { this.plugin.settings.barPreheatCollapseMs = Number(v) || DEFAULT_SETTINGS.barPreheatCollapseMs; await this.plugin.saveSettings(); }));
 
-    this.hr(containerEl);
+    containerEl.createEl("hr", { cls: "tag-tree-settings-hr" });
 
-    // ===== Layout（面板布局） =====
-    containerEl.createEl("div", { text: "面板布局（Layout）", cls: "tag-tree-settings-group-title" });
-
-    new Setting(containerEl).setName("Side padding (px)")
-      .setDesc("插件内容与容器左右的距离（像素）。")
+    // 布局设置组
+    containerEl.createEl("div", { text: "面板布局 (Layout)", cls: "tag-tree-settings-group-title" });
+    new Setting(containerEl).setName("Side padding (px)").setDesc("插件内容距离左右容器边缘的距离")
       .addText(t => t.setValue(String(this.plugin.settings.sidePadding)).onChange(async v => { this.plugin.settings.sidePadding = Number(v) || DEFAULT_SETTINGS.sidePadding; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Sub-tag indent (px)")
-      .setDesc("子标签名称相对于父标签的缩进距离（像素）。注意背景条不会缩进，只是文字缩进。")
+    new Setting(containerEl).setName("Sub-tag indent (px)").setDesc("子标签文本相对于父标签的缩进距离（背景条保持与父对齐）")
       .addText(t => t.setValue(String(this.plugin.settings.subTagIndent)).onChange(async v => { this.plugin.settings.subTagIndent = Number(v) || DEFAULT_SETTINGS.subTagIndent; await this.plugin.saveSettings(); }));
 
-    new Setting(containerEl).setName("Right padding (px)")
-      .setDesc("背景条在计算最大宽度时留在右侧的额外空白（像素）。")
-      .addText(t => t.setValue(String(this.plugin.settings.rightPadding)).onChange(async v => { this.plugin.settings.rightPadding = Number(v) || DEFAULT_SETTINGS.rightPadding; await this.plugin.saveSettings(); }));
+    containerEl.createEl("hr", { cls: "tag-tree-settings-hr" });
 
-    this.hr(containerEl);
-
-    // ===== Personalization（个性化——颜色 / 圆角 / 透明度） =====
-    containerEl.createEl("div", { text: "个性化（Personalization）", cls: "tag-tree-settings-group-title" });
-
+    // 个性化（颜色等）
+    containerEl.createEl("div", { text: "个性化 (Colors & Appearance)", cls: "tag-tree-settings-group-title" });
     try {
-      new Setting(containerEl).setName("Bar color — lowest").setDesc("四档颜色：最低档。")
-        .addColorPicker(cb => cb.setValue(this.plugin.settings.barColor0).onChange(async (v) => { this.plugin.settings.barColor0 = v; await this.plugin.saveSettings(); }));
-      new Setting(containerEl).setName("Bar color — low").setDesc("四档颜色：低档。")
-        .addColorPicker(cb => cb.setValue(this.plugin.settings.barColor1).onChange(async (v) => { this.plugin.settings.barColor1 = v; await this.plugin.saveSettings(); }));
-      new Setting(containerEl).setName("Bar color — mid").setDesc("四档颜色：中档。")
-        .addColorPicker(cb => cb.setValue(this.plugin.settings.barColor2).onChange(async (v) => { this.plugin.settings.barColor2 = v; await this.plugin.saveSettings(); }));
-      new Setting(containerEl).setName("Bar color — high").setDesc("四档颜色：高档。")
-        .addColorPicker(cb => cb.setValue(this.plugin.settings.barColor3).onChange(async (v) => { this.plugin.settings.barColor3 = v; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - lowest").addColorPicker(cb => cb.setValue(this.plugin.settings.barColor0).onChange(async v => { this.plugin.settings.barColor0 = v; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - low").addColorPicker(cb => cb.setValue(this.plugin.settings.barColor1).onChange(async v => { this.plugin.settings.barColor1 = v; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - mid").addColorPicker(cb => cb.setValue(this.plugin.settings.barColor2).onChange(async v => { this.plugin.settings.barColor2 = v; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - high").addColorPicker(cb => cb.setValue(this.plugin.settings.barColor3).onChange(async v => { this.plugin.settings.barColor3 = v; await this.plugin.saveSettings(); }));
     } catch (e) {
-      new Setting(containerEl).setName("Bar color — lowest (hex)").setDesc("四档颜色：最低档（十六进制）。").addText(t => t.setValue(this.plugin.settings.barColor0).onChange(async v => { this.plugin.settings.barColor0 = v || DEFAULT_SETTINGS.barColor0; await this.plugin.saveSettings(); }));
-      new Setting(containerEl).setName("Bar color — low (hex)").setDesc("四档颜色：低档（十六进制）。").addText(t => t.setValue(this.plugin.settings.barColor1).onChange(async v => { this.plugin.settings.barColor1 = v || DEFAULT_SETTINGS.barColor1; await this.plugin.saveSettings(); }));
-      new Setting(containerEl).setName("Bar color — mid (hex)").setDesc("四档颜色：中档（十六进制）。").addText(t => t.setValue(this.plugin.settings.barColor2).onChange(async v => { this.plugin.settings.barColor2 = v || DEFAULT_SETTINGS.barColor2; await this.plugin.saveSettings(); }));
-      new Setting(containerEl).setName("Bar color — high (hex)").setDesc("四档颜色：高档（十六进制）。").addText(t => t.setValue(this.plugin.settings.barColor3).onChange(async v => { this.plugin.settings.barColor3 = v || DEFAULT_SETTINGS.barColor3; await this.plugin.saveSettings(); }));
+      // 如果 addColorPicker 不可用，退回为文本输入
+      new Setting(containerEl).setName("Color - lowest (hex)").addText(t => t.setValue(this.plugin.settings.barColor0).onChange(async v => { this.plugin.settings.barColor0 = v || DEFAULT_SETTINGS.barColor0; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - low (hex)").addText(t => t.setValue(this.plugin.settings.barColor1).onChange(async v => { this.plugin.settings.barColor1 = v || DEFAULT_SETTINGS.barColor1; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - mid (hex)").addText(t => t.setValue(this.plugin.settings.barColor2).onChange(async v => { this.plugin.settings.barColor2 = v || DEFAULT_SETTINGS.barColor2; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName("Color - high (hex)").addText(t => t.setValue(this.plugin.settings.barColor3).onChange(async v => { this.plugin.settings.barColor3 = v || DEFAULT_SETTINGS.barColor3; await this.plugin.saveSettings(); }));
     }
+    new Setting(containerEl).setName("Bar corner radius (px)").addText(t => t.setValue(String(this.plugin.settings.barCornerRadius)).onChange(async v => { this.plugin.settings.barCornerRadius = Number(v) || DEFAULT_SETTINGS.barCornerRadius; await this.plugin.saveSettings(); }));
 
-    new Setting(containerEl).setName("Bar corner radius (px)")
-      .setDesc("背景条圆角（像素）。")
-      .addText(t => t.setValue(String(this.plugin.settings.barCornerRadius)).onChange(async v => { this.plugin.settings.barCornerRadius = Number(v) || DEFAULT_SETTINGS.barCornerRadius; await this.plugin.saveSettings(); }));
+    containerEl.createEl("hr", { cls: "tag-tree-settings-hr" });
 
-    new Setting(containerEl).setName("Active bar opacity").setDesc("活动状态时，背景条的不透明度（0–1）。")
-      .addText(t => t.setValue(String(this.plugin.settings.activeBarOpacity)).onChange(async v => { this.plugin.settings.activeBarOpacity = Math.max(0, Math.min(1, Number(v) || DEFAULT_SETTINGS.activeBarOpacity)); await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl).setName("Idle bar alpha").setDesc("空闲状态时，背景条的 alpha（0–1）。")
-      .addText(t => t.setValue(String(this.plugin.settings.idleBarAlpha)).onChange(async v => { this.plugin.settings.idleBarAlpha = Math.max(0, Math.min(1, Number(v) || DEFAULT_SETTINGS.idleBarAlpha)); await this.plugin.saveSettings(); }));
-
-    this.hr(containerEl);
-
-    // ===== Idle timeout（进入空闲状态的无操作时长） =====
-    containerEl.createEl("div", { text: "空闲（Idle）设置", cls: "tag-tree-settings-group-title" });
-    new Setting(containerEl)
-      .setName("进入空闲的无操作时长（ms）")
-      .setDesc("在面板内没有交互（鼠标/键盘/触摸/滚轮/悬停）达到该时间后进入空闲状态（字体透明并显示高亮背景条）。")
-      .addText(text => text
-        .setValue(String(this.plugin.settings.idleTimeout ?? DEFAULT_SETTINGS.idleTimeout))
-        .onChange(async (v) => {
-          const n = Number(v);
-          this.plugin.settings.idleTimeout = Number.isNaN(n) ? DEFAULT_SETTINGS.idleTimeout : Math.max(0, Math.floor(n));
-          await this.plugin.saveSettings();
-        })
-      );
+    // 排序设置
+    containerEl.createEl("div", { text: "排序 (Sorting)", cls: "tag-tree-settings-group-title" });
+    new Setting(containerEl).setName("Sort by").addDropdown(d => d.addOption("count", "Count").addOption("latest", "Latest").setValue(this.plugin.settings.sortBy).onChange(async v => { this.plugin.settings.sortBy = v as any; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Sort order").addDropdown(d => d.addOption("desc", "Descending").addOption("asc", "Ascending").setValue(this.plugin.settings.sortOrder).onChange(async v => { this.plugin.settings.sortOrder = v as any; await this.plugin.saveSettings(); }));
   }
 }
 
-/* helpers */
+/* ---------- 辅助工具函数 ---------- */
 function escSelector(s: string) {
+  // CSS.escape 兼容性处理
   // @ts-ignore
   if (typeof (window as any).CSS?.escape === "function") return (window as any).CSS.escape(s);
   return s.replace(/(["\\#.:?+*~\[\]()'`=!<>|\/@{}])/g, "\\$1");
@@ -277,8 +246,8 @@ function hexToRgb(hex: string) {
   const bigint = parseInt(normalized, 16);
   return { r: (bigint >> 16) & 255, g: (bigint >> 8) & 255, b: bigint & 255 };
 }
+const INLINE_TAG_RE = /(?:^|\s|[^\\\w-])#([\u4e00-\u9fff\w\/\-_]+)/g;
 
-/* parse YAML frontmatter helper */
 function parseFrontmatterTagsFromContent(content: string): string[] {
   const res: string[] = [];
   if (!content) return res;
@@ -292,14 +261,14 @@ function parseFrontmatterTagsFromContent(content: string): string[] {
   let tail = tagsLineMatch[2].trim();
   if (tail.startsWith("[")) {
     const inner = tail.replace(/^\[|\]$/g, "");
-    const parts = inner.split(",").map(s => s.replace(/['"]/g, "").trim()).filter(Boolean);
+    const parts = inner.split(",").map((s: string) => s.replace(/['"]/g, "").trim()).filter(Boolean);
     for (const p of parts) res.push(p.startsWith("#") ? p.slice(1) : p);
     return Array.from(new Set(res));
   }
 
   if (/^["'].*["']$/.test(tail) || tail.indexOf(",") !== -1) {
     const cleaned = tail.replace(/^["']|["']$/g, "");
-    const parts = cleaned.split(",").map(s => s.trim()).filter(Boolean);
+    const parts = cleaned.split(",").map((s: string) => s.trim()).filter(Boolean);
     for (const p of parts) res.push(p.startsWith("#") ? p.slice(1) : p);
     return Array.from(new Set(res));
   }
@@ -322,37 +291,39 @@ function parseFrontmatterTagsFromContent(content: string): string[] {
   return Array.from(new Set(res));
 }
 
-/* inline tag regex helper */
-const INLINE_TAG_RE = /(?:^|\s|[^\\\w-])#([\u4e00-\u9fff\w\/\-_]+)/g;
-
-/* TagTreeView （核心实现保留之前的成熟逻辑，略去部分重复注释，关注已修改点） */
+/* ---------- 主视图类 ---------- */
 class TagTreeView extends ItemView {
-  public readonly app: App;
-  private settings: Settings;
-  private rootNode: TagNode | null = null;
-  private maxCount = 0;
-  private idleTimeout: ReturnType<typeof setTimeout> | null = null;
-  private treeContainer: HTMLElement | null = null;
-  private barOverlay: HTMLElement | null = null;
-  private _idleReset: (() => void) | null = null;
-  private readonly rowHeight = 22;
+  app: App;
+  settings: Settings;
+  rootNode: TagNode | null = null;
+  maxCount = 0;
+  idleTimeout: ReturnType<typeof setTimeout> | null = null;
+  treeContainer: HTMLElement | null = null;
+  barOverlay: HTMLElement | null = null;
+  _idleReset: (() => void) | null = null;
 
-  private perFileTagMap: Record<string, string[]> = {};
-  private tagCounts: Record<string, number> = {};
+  // 存储文件到标签映射 与 计数
+  perFileTagMap: Record<string, string[]> = {};
+  tagCounts: Record<string, number> = {};
+  tagLastUsed: Record<string, number> = {};
 
-  private pendingFilesForMeta: Set<string> = new Set();
-  private metaTimer: number | null = null;
+  // 热更新相关
+  pendingFilesForMeta: Set<string> = new Set();
+  metaTimer: number | null = null;
+  modifyTimers: Record<string, number> = {};
+  overlayRebuildTimer: number | null = null;
 
-  private modifyTimers: Record<string, number> = {};
-  private rafId: number | null = null;
-  private overlaySyncEndAt = 0;
-  private overlayInstantUntil = 0;
-  private lastRebuildTime = 0;
+  // overlay 与动画同步
+  rafId: number | null = null;
+  overlaySyncEndAt = 0;
+  overlayInstantUntil = 0;
+  lastRebuildTime = 0;
 
-  private resizeObserver: ResizeObserver | null = null;
+  // resize observer
+  resizeObserver: ResizeObserver | null = null;
 
-  private creatingDuringExpand = false;
-  private currentOpId = 0;
+  currentOpId = 0;
+  creatingDuringExpand = false;
 
   constructor(leaf: WorkspaceLeaf, app: App, settings: Settings) {
     super(leaf);
@@ -362,17 +333,27 @@ class TagTreeView extends ItemView {
 
   getViewType() { return VIEW_TYPE_TAG_TREE; }
   getDisplayText() { return "标签树状面板"; }
+  // 在 TagTreeView 类内新增：
+  getIcon(): string {
+    // 可选图标示例（Obsidian 使用 lucide 图标集）
+    // 常用： "tags", "tag", "bar-chart-2", "pie-chart", "layers", "list", "search"
+    return "list-tree";
+  }
+
 
   async onOpen(): Promise<void> {
     this.containerEl.empty();
     this.containerEl.addClass("tag-tree-view-container");
+    // 设置内边距
     this.containerEl.style.paddingLeft = `${this.settings.sidePadding}px`;
     this.containerEl.style.paddingRight = `${this.settings.sidePadding}px`;
-    this.containerEl.style.paddingTop = `16px`;
+    this.containerEl.style.paddingTop = `12px`;
     this.containerEl.style.paddingBottom = `12px`;
 
+    // 初始化 per-file 标签映射与计数
     await this.initializePerFileMapAndCounts();
 
+    // 监听 Vault 事件（create/delete/modify/rename）
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (file instanceof TFile && file.extension === "md") this.onFileCreated(file);
     }));
@@ -382,46 +363,38 @@ class TagTreeView extends ItemView {
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (file instanceof TFile) this.onFileRenamed(file, oldPath);
     }));
-
-    // vault.modify: cache-first 快速检测
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
       const p = file.path;
-
       if (this.modifyTimers[p]) { clearTimeout(this.modifyTimers[p]); delete this.modifyTimers[p]; }
-
       this.modifyTimers[p] = window.setTimeout(async () => {
         delete this.modifyTimers[p];
-
         const cache = this.app.metadataCache.getFileCache(file);
         const cacheTags = this.getTagsFromCacheDirect(cache);
-
         if (!arrayEqual(cacheTags, this.perFileTagMap[p])) {
-          this.handleSingleFileCacheChange(p, cacheTags);
+          this.handleSingleFileCacheChange(p, cacheTags, file);
           return;
         }
-
-        // fallback: 读盘解析（若 cache 没有变化）
         const fileTags = await this.getTagsFromFileAsync(p);
         if (!arrayEqual(fileTags, this.perFileTagMap[p])) {
-          this.handleSingleFileCacheChange(p, fileTags);
+          this.handleSingleFileCacheChange(p, fileTags, file);
           return;
         }
       }, Math.max(12, Math.min(120, this.settings.metadataDebounceMs)));
     }));
 
+    // metadataCache changed 事件（差异化）
     this.registerEvent(this.app.metadataCache.on("changed", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
-
       const cache = this.app.metadataCache.getFileCache(file);
       const cacheTags = this.getTagsFromCacheDirect(cache);
       const prev = this.perFileTagMap[file.path] || [];
       if (!arrayEqual(cacheTags, prev)) {
+        // 立刻处理该文件
         this.pendingFilesForMeta.delete(file.path);
-        this.handleSingleFileCacheChange(file.path, cacheTags);
+        this.handleSingleFileCacheChange(file.path, cacheTags, file);
         return;
       }
-
       this.pendingFilesForMeta.add(file.path);
       if (this.metaTimer) window.clearTimeout(this.metaTimer);
       this.metaTimer = window.setTimeout(() => {
@@ -434,10 +407,12 @@ class TagTreeView extends ItemView {
 
     this.bindIdleEvents();
 
+    // treeContainer: 实际树 DOM（ul/li）
     this.treeContainer = this.containerEl.createDiv();
     this.treeContainer.className = "tag-tree-root";
     this.treeContainer.style.position = "relative";
 
+    // overlay 放置背景条（absolute），在 treeContainer 内
     this.barOverlay = this.treeContainer.createDiv("tag-tree-bar-overlay");
     this.barOverlay.style.position = "absolute";
     this.barOverlay.style.left = "0";
@@ -447,15 +422,21 @@ class TagTreeView extends ItemView {
     this.barOverlay.style.pointerEvents = "none";
     this.barOverlay.style.zIndex = "1";
 
+    // resize observer：窗口大小变动时重绘 overlay
     this.resizeObserver = new ResizeObserver(() => {
       this.rebuildOverlayBars();
       this.startOverlaySync(Math.max(200, this.settings.expandDuration));
     });
     if (this.treeContainer) this.resizeObserver.observe(this.treeContainer);
 
-    this.rootNode = this.buildTagTree(this.tagCounts);
+    // 建树并渲染
+    this.rootNode = this.buildTagTreeWithLastUsed(this.tagCounts, this.tagLastUsed);
     this.accumulateCounts(this.rootNode);
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
+
+    // 全局拖放处理：拖拽时将 #tag 文本插入到目标输入或 editor
+    this.registerDomEvent(document, "drop", this.handleDocumentDrop.bind(this));
+    this.registerDomEvent(document, "dragover", (e: DragEvent) => { e.preventDefault(); });
 
     this.renderTree(true);
   }
@@ -466,19 +447,25 @@ class TagTreeView extends ItemView {
     if (this.resizeObserver && this.treeContainer) { this.resizeObserver.unobserve(this.treeContainer); this.resizeObserver.disconnect(); this.resizeObserver = null; }
   }
 
-  // ---------- metadata helpers ----------
+  /* ---------- 初始化与标签收集 ---------- */
   private async initializePerFileMapAndCounts() {
     const files = this.app.vault.getMarkdownFiles();
     this.perFileTagMap = {};
     this.tagCounts = {};
+    this.tagLastUsed = {};
     for (const f of files) {
       const tags = this.getTagsFromFileCache(f);
       this.perFileTagMap[f.path] = tags;
-      for (const t of tags) this.tagCounts[t] = (this.tagCounts[t] || 0) + 1;
+      for (const t of tags) {
+        this.tagCounts[t] = (this.tagCounts[t] || 0) + 1;
+        const mtime = (f.stat && (f.stat.mtime || f.stat.mtime != null)) ? (f.stat.mtime as unknown as number) : Date.now();
+        this.tagLastUsed[t] = Math.max(this.tagLastUsed[t] || 0, mtime);
+      }
     }
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
   }
 
+  // 从 cache（metadataCache）直接取 tags（包含 inline tags 与 frontmatter tags）
   private getTagsFromFileCache(file: TFile): string[] {
     const cache = this.app.metadataCache.getFileCache(file);
     const set = new Set<string>();
@@ -503,7 +490,7 @@ class TagTreeView extends ItemView {
             if (v) set.add(v);
           }
         } else if (typeof fmTags === "string") {
-          const parts = fmTags.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+          const parts = fmTags.split(/\s*,\s*/).map((s: string) => s.trim()).filter(Boolean);
           for (const p of parts) {
             let v = p;
             if (v.startsWith("#")) v = v.slice(1);
@@ -538,7 +525,7 @@ class TagTreeView extends ItemView {
           if (v) set.add(v);
         }
       } else if (typeof fm === "string") {
-        const parts = fm.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+        const parts = fm.split(/\s*,\s*/).map((s: string) => s.trim()).filter(Boolean);
         for (const p of parts) {
           let v = p;
           if (v.startsWith("#")) v = v.slice(1);
@@ -549,6 +536,7 @@ class TagTreeView extends ItemView {
     return Array.from(set);
   }
 
+  // 当 cache 中没有 frontmatter tags 时，延迟读取文件以解析 frontmatter
   private async getTagsFromFileAsync(path: string): Promise<string[]> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return [];
@@ -567,16 +555,14 @@ class TagTreeView extends ItemView {
       if ((cache as any).frontmatter && (cache as any).frontmatter.tags) {
         const fmTags = (cache as any).frontmatter.tags;
         if (Array.isArray(fmTags)) frontTagsFromCache = fmTags.map((t: any) => String(t || "").trim()).filter(Boolean);
-        else if (typeof fmTags === "string") frontTagsFromCache = (fmTags.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean));
+        else if (typeof fmTags === "string") frontTagsFromCache = (fmTags.split(/\s*,\s*/).map((s: string) => s.trim()).filter(Boolean));
       }
     }
-
     const mergedQuick = Array.from(new Set([...(inlineTags || []), ...(frontTagsFromCache || [])].map(s => s.startsWith("#") ? s.slice(1) : s)));
     if (frontTagsFromCache && frontTagsFromCache.length > 0) return mergedQuick;
 
     const delay = Math.max(0, Number(this.settings.frontmatterReadDelay || DEFAULT_SETTINGS.frontmatterReadDelay));
     if (delay > 0) await new Promise(res => setTimeout(res, delay));
-
     try {
       const content = await this.app.vault.read(file);
       const fmTags = parseFrontmatterTagsFromContent(content);
@@ -595,34 +581,36 @@ class TagTreeView extends ItemView {
     }
   }
 
-  private async onFileCreated(file: TFile) {
-    const newTags = await this.getTagsFromFileAsync(file.path);
-    this.perFileTagMap[file.path] = newTags;
-    const added: string[] = [];
-    for (const t of newTags) {
-      const prev = this.tagCounts[t] || 0;
-      this.tagCounts[t] = prev + 1;
-      if (prev === 0) added.push(t);
-    }
-    this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
-
-    if (added.length > 0) {
-      this.rootNode = this.buildTagTree(this.tagCounts);
-      this.accumulateCounts(this.rootNode);
+  /* ---------- Vault 文件事件处理（create/delete/modify/rename） ---------- */
+  private onFileCreated(file: TFile) {
+    void (async () => {
+      const newTags = await this.getTagsFromFileAsync(file.path);
+      this.perFileTagMap[file.path] = newTags;
+      const added: string[] = [];
+      const mtime = (file.stat && (file.stat.mtime || file.stat.mtime != null)) ? (file.stat.mtime as unknown as number) : Date.now();
+      for (const t of newTags) {
+        const prev = this.tagCounts[t] || 0;
+        this.tagCounts[t] = prev + 1;
+        this.tagLastUsed[t] = Math.max(this.tagLastUsed[t] || 0, mtime);
+        if (prev === 0) added.push(t);
+      }
       this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
-      this.renderTree(false);
-      nextAnimationFrame().then(() => nextAnimationFrame()).then(() => {
+
+      if (added.length > 0) {
+        this.rootNode = this.buildTagTreeWithLastUsed(this.tagCounts, this.tagLastUsed);
+        this.accumulateCounts(this.rootNode);
+        this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
+        this.renderTree(false);
+        await nextAnimationFrame(); await nextAnimationFrame();
         for (const t of added) {
-          this.createBarForFullpathWithRetry(t, 6).then(ok => {
-            if (!ok) this.scheduleOverlayRebuild(120);
-          });
+          this.createBarForFullpathWithRetry(t, 6).then(ok => { if (!ok) this.scheduleOverlayRebuild(120); });
         }
         this.startOverlaySync(this.settings.expandDuration + 80);
-      });
-    } else {
-      const affected = newTags.filter(t => !!(this.treeContainer?.querySelector(`li.tag-tree-li[data-fullpath="${escSelector(t)}"]`)));
-      if (affected.length > 0) this.updateCountsAndBars(affected);
-    }
+      } else {
+        const affected = newTags.filter(t => !!(this.treeContainer?.querySelector(`li.tag-tree-li[data-fullpath="${escSelector(t)}"]`)));
+        if (affected.length > 0) this.updateCountsAndBars(affected);
+      }
+    })();
   }
 
   private onFileDeleted(file: TFile) {
@@ -632,12 +620,12 @@ class TagTreeView extends ItemView {
     for (const t of oldTags) {
       const prev = this.tagCounts[t] || 0;
       const now = Math.max(0, prev - 1);
-      if (now === 0) { delete this.tagCounts[t]; removed.push(t); } else this.tagCounts[t] = now;
+      if (now === 0) { delete this.tagCounts[t]; removed.push(t); delete this.tagLastUsed[t]; } else this.tagCounts[t] = now;
     }
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
 
     if (removed.length > 0) {
-      this.rootNode = this.buildTagTree(this.tagCounts);
+      this.rootNode = this.buildTagTreeWithLastUsed(this.tagCounts, this.tagLastUsed);
       this.accumulateCounts(this.rootNode);
       this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
       this.renderTree(false);
@@ -672,10 +660,11 @@ class TagTreeView extends ItemView {
       delete this.perFileTagMap[oldPath];
       this.perFileTagMap[file.path] = tags;
     } else {
-      void this.onFileCreated(file);
+      this.onFileCreated(file);
     }
   }
 
+  // 批量处理 metadata 变更（差异化渲染）
   private async processMetadataChanges(paths: string[]) {
     const globallyAdded: Set<string> = new Set();
     const globallyRemoved: Set<string> = new Set();
@@ -715,6 +704,11 @@ class TagTreeView extends ItemView {
           changedTagsSet.add(t);
         }
       }
+
+      const mtime = (file.stat && (file.stat.mtime || file.stat.mtime != null)) ? (file.stat.mtime as unknown as number) : Date.now();
+      for (const t of newTags) {
+        this.tagLastUsed[t] = Math.max(this.tagLastUsed[t] || 0, mtime);
+      }
     }
 
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
@@ -725,9 +719,7 @@ class TagTreeView extends ItemView {
 
     const recheckDelay = Math.max(40, (this.settings.frontmatterReadDelay || DEFAULT_SETTINGS.frontmatterReadDelay) * 2);
     setTimeout(async () => {
-      const recheckPaths = paths.filter(p => {
-        return !!this.app.vault.getAbstractFileByPath(p);
-      });
+      const recheckPaths = paths.filter(p => !!this.app.vault.getAbstractFileByPath(p));
       if (recheckPaths.length === 0) return;
       let anyChange = false;
       for (const p of recheckPaths) {
@@ -750,17 +742,9 @@ class TagTreeView extends ItemView {
     }, recheckDelay);
   }
 
-  private overlayRebuildTimer: number | null = null;
-  private useRequestIdle = typeof (window as any).requestIdleCallback === "function";
-
+  /* ---------- Overlay / 重建/差异化更新 ---------- */
   private scheduleOverlayRebuild(delay = 160) {
     if (this.overlayRebuildTimer) { clearTimeout(this.overlayRebuildTimer); this.overlayRebuildTimer = null; }
-    if (this.useRequestIdle) {
-      try {
-        (window as any).requestIdleCallback(() => { this.rebuildOverlayBars(); }, { timeout: delay });
-        return;
-      } catch (e) {}
-    }
     this.overlayRebuildTimer = window.setTimeout(() => {
       this.rebuildOverlayBars();
       this.overlayRebuildTimer = null;
@@ -768,24 +752,21 @@ class TagTreeView extends ItemView {
   }
 
   private async handleTagsAdded(tags: string[]) {
-    this.rootNode = this.buildTagTree(this.tagCounts);
+    this.rootNode = this.buildTagTreeWithLastUsed(this.tagCounts, this.tagLastUsed);
     this.accumulateCounts(this.rootNode);
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
 
     this.renderTree(false);
+    await nextAnimationFrame(); await nextAnimationFrame();
 
-    await nextAnimationFrame();
-    await nextAnimationFrame();
     for (const t of tags) {
-      this.createBarForFullpathWithRetry(t, 6).then(ok => {
-        if (!ok) this.scheduleOverlayRebuild(120);
-      });
+      this.createBarForFullpathWithRetry(t, 6).then(ok => { if (!ok) this.scheduleOverlayRebuild(120); });
     }
     this.startOverlaySync(this.settings.expandDuration + 80);
   }
 
   private handleTagsRemoved(tags: string[]) {
-    this.rootNode = this.buildTagTree(this.tagCounts);
+    this.rootNode = this.buildTagTreeWithLastUsed(this.tagCounts, this.tagLastUsed);
     this.accumulateCounts(this.rootNode);
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
 
@@ -813,11 +794,11 @@ class TagTreeView extends ItemView {
   }
 
   private updateCountsAndBars(tags: string[]) {
-    if (!this.barOverlay) return;
+    if (!this.barOverlay || !this.treeContainer) return;
     for (const t of tags) {
-      const li = this.treeContainer?.querySelector<HTMLLIElement>(`li.tag-tree-li[data-fullpath="${escSelector(t)}"]`);
+      const li = this.treeContainer.querySelector<HTMLLIElement>(`li.tag-tree-li[data-fullpath="${escSelector(t)}"]`);
       if (li) {
-        const cnt = li.querySelector<HTMLElement>(".tag-tree-view-count");
+        const cnt = li.querySelector<HTMLElement>(".tag-tree-count");
         if (cnt) cnt.textContent = String(this.tagCounts[t] || 0);
       }
     }
@@ -827,7 +808,6 @@ class TagTreeView extends ItemView {
       const b = this.barOverlay.querySelector<HTMLElement>(sel);
       const count = this.tagCounts[t] || 0;
 
-      if (!this.treeContainer) continue;
       const treeRect = this.treeContainer.getBoundingClientRect();
       const liFor = this.treeContainer.querySelector<HTMLLIElement>(`li.tag-tree-li[data-fullpath="${escSelector(t)}"]`);
       const alignLeftForUpdate = liFor ? liFor.getBoundingClientRect().left - treeRect.left : 0;
@@ -860,6 +840,34 @@ class TagTreeView extends ItemView {
     this.startOverlaySync(Math.max(120, this.settings.barAnimationDuration));
   }
 
+  /* ---------- 构造/渲染 树结构 ---------- */
+  private buildTagTreeWithLastUsed(tagCounts: Record<string, number>, tagLastUsed: Record<string, number>): TagNode {
+    const root: TagNode = { name: "", fullPath: "", count: 0, children: new Map(), expanded: true, lastUsed: 0 };
+    for (const fullTag in tagCounts) {
+      const parts = fullTag.split("/");
+      let cur = root;
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        if (!cur.children.has(part)) {
+          cur.children.set(part, {
+            name: part,
+            fullPath: cur.fullPath ? `${cur.fullPath}/${part}` : part,
+            count: 0,
+            children: new Map(),
+            expanded: false,
+            lastUsed: 0,
+          });
+        }
+        cur = cur.children.get(part)!;
+        if (i === parts.length - 1) {
+          cur.count = tagCounts[fullTag];
+          cur.lastUsed = tagLastUsed[fullTag] || 0;
+        }
+      }
+    }
+    return root;
+  }
+
   private renderTree(rebuildOverlay = true) {
     if (!this.treeContainer || !this.rootNode) return;
 
@@ -885,16 +893,15 @@ class TagTreeView extends ItemView {
     this.renderNode(this.rootNode, ul, 0, null);
     this.treeContainer.appendChild(ul);
 
-    if (rebuildOverlay) {
-      this.rebuildOverlayBars();
-    } else {
-      this.startOverlaySync(this.settings.expandDuration + 80);
-    }
+    if (rebuildOverlay) this.rebuildOverlayBars();
+    else this.startOverlaySync(this.settings.expandDuration + 80);
   }
 
   private renderNode(node: TagNode, container: HTMLElement, level: number, parentAlignLeft: number | null) {
     if (node.name === "") {
-      node.children.forEach(child => this.renderNode(child, container, level, parentAlignLeft));
+      const childrenArr = Array.from(node.children.values());
+      const sorted = this.sortChildren(childrenArr);
+      sorted.forEach(child => this.renderNode(child, container, level, parentAlignLeft));
       return;
     }
 
@@ -902,9 +909,10 @@ class TagTreeView extends ItemView {
     li.className = "tag-tree-li";
     (li as HTMLElement).dataset.fullPath = node.fullPath;
     li.style.position = "relative";
-    li.style.height = `${this.rowHeight}px`;
+    li.style.height = `24px`;
     li.style.zIndex = "3";
 
+    // 箭头
     if (node.children.size > 0) {
       const arrow = document.createElement("span");
       arrow.className = "tag-tree-view-arrow";
@@ -922,15 +930,21 @@ class TagTreeView extends ItemView {
 
     const flex = document.createElement("div");
     flex.className = "tag-tree-view-flex-container";
-    flex.style.marginLeft = `${this.settings.subTagIndent * (level + 1)}px`;
+    // 仅文本缩进（背景条对齐由 overlay 控制）
+    (flex as HTMLElement).style.marginLeft = `${this.settings.subTagIndent * (level + 1)}px`;
+
     const nameSpan = document.createElement("span");
-    nameSpan.className = "tag-name";
+    nameSpan.className = "tag-tree-name";
     nameSpan.textContent = node.name;
     nameSpan.onclick = (e) => { e.stopPropagation(); this.openSearchWithTag(node.fullPath); };
+
+    // 立即支持拖拽（无长按）
+    this.attachDragHandlers(nameSpan, node.fullPath);
+
     flex.appendChild(nameSpan);
 
     const cnt = document.createElement("span");
-    cnt.className = "tag-tree-view-count";
+    cnt.className = "tag-tree-count";
     cnt.textContent = node.count.toString();
     flex.appendChild(cnt);
 
@@ -944,11 +958,13 @@ class TagTreeView extends ItemView {
     const alignLeft = parentAlignLeft !== null ? parentAlignLeft : thisLineLeft;
 
     if (this.barOverlay && !this.barOverlay.querySelector(`.tag-tree-view-bg-bar[data-fullpath="${escSelector(node.fullPath)}"]`)) {
+      // 新建 overlay 背景条（差异化创建）
       const bar = document.createElement("div");
       bar.className = "tag-tree-view-bg-bar";
       bar.setAttribute("data-fullpath", node.fullPath);
       bar.setAttribute("data-count", String(node.count));
 
+      // 根据容器宽度自适应最大宽度
       const containerClientWidth = this.treeContainer.clientWidth || (treeRect.right - treeRect.left);
       const rightPadding = Number(this.settings.rightPadding || DEFAULT_SETTINGS.rightPadding);
       const available = Math.max(40, containerClientWidth - alignLeft - rightPadding);
@@ -957,39 +973,39 @@ class TagTreeView extends ItemView {
       const w = (node.count / Math.max(1, this.maxCount)) * actualMaxBarWidth;
       bar.style.left = `${alignLeft}px`;
       bar.style.transform = `translateY(${liRect.top - treeRect.top}px)`;
-      bar.style.width = `${w}px`;
+      bar.style.width = `0px`; // 新建先为 0，随后扩展（动画）
       bar.style.height = `${liRect.height}px`;
       bar.style.borderRadius = `${this.settings.barCornerRadius}px`;
 
-      const raw = this.getBgBarColorRaw(node.count);
       const inner = document.createElement("div");
       inner.className = "bar-inner";
+      const raw = this.getBgBarColorRaw(node.count);
+      inner.style.backgroundColor = this.containerEl.hasClass("idle")
+        ? `rgba(${raw.r},${raw.g},${raw.b},${this.settings.idleBarAlpha})`
+        : `rgba(${raw.r},${raw.g},${raw.b},${this.settings.activeBarOpacity})`;
 
       inner.style.borderRadius = `${this.settings.barCornerRadius}px`;
-      if (this.creatingDuringExpand) {
-        inner.style.backgroundColor = this.containerEl.hasClass("idle")
-          ? `rgba(${raw.r},${raw.g},${raw.b},${this.settings.idleBarAlpha})`
-          : `rgba(${raw.r},${raw.g},${raw.b},${this.settings.activeBarOpacity})`;
-        inner.style.transition = `transform ${Math.max(80, this.settings.barExpandDuration)}ms ${this.settings.expandEasing}, opacity ${Math.max(40, this.settings.barFadeInDuration)}ms linear, background-color 200ms linear`;
-        inner.style.transformOrigin = "left center";
-        inner.style.transform = "scaleX(0)";
-        inner.style.opacity = "0";
-        bar.setAttribute("data-new", "1");
-      } else {
-        inner.style.backgroundColor = this.containerEl.hasClass("idle")
-          ? `rgba(${raw.r},${raw.g},${raw.b},${this.settings.idleBarAlpha})`
-          : `rgba(${raw.r},${raw.g},${raw.b},${this.settings.activeBarOpacity})`;
-        inner.style.transition = `transform ${Math.max(80, this.settings.barAnimationDuration)}ms ${this.settings.expandEasing}, opacity ${Math.max(40, this.settings.barFadeDuration)}ms linear, background-color 200ms linear`;
-        inner.style.transformOrigin = "left center";
-        inner.style.transform = "scaleX(1)";
-        inner.style.opacity = "1";
-        bar.setAttribute("data-new", "0");
-      }
+      inner.style.transformOrigin = "left center";
+      inner.style.transform = "scaleX(0)";
+      inner.style.opacity = "0";
+      inner.style.transition = `transform ${Math.max(80, this.settings.barExpandDuration)}ms ${this.settings.expandEasing}, opacity ${Math.max(40, this.settings.barFadeInDuration)}ms linear`;
 
       bar.appendChild(inner);
       this.barOverlay.appendChild(bar);
+
+      // 启动扩展动画（下一帧）
+      requestAnimationFrame(() => {
+        const animateWidthMs = Math.max(80, this.settings.barExpandDuration);
+        bar.style.transition = `width ${animateWidthMs}ms ${this.settings.expandEasing}, left ${animateWidthMs}ms ${this.settings.expandEasing}`;
+        bar.style.width = `${w}px`;
+        requestAnimationFrame(() => {
+          inner.style.transform = "scaleX(1)";
+          inner.style.opacity = "1";
+        });
+      });
     }
 
+    // 递归渲染子节点（如果展开）
     if (node.expanded && node.children.size > 0) {
       const ul = document.createElement("ul");
       ul.className = "tag-tree-children";
@@ -1001,34 +1017,76 @@ class TagTreeView extends ItemView {
       ul.style.opacity = "0";
 
       this.creatingDuringExpand = true;
-      node.children.forEach((child) => this.renderNode(child, ul, level + 1, alignLeft));
+      const childrenArr = Array.from(node.children.values());
+      const sortedChildren = this.sortChildren(childrenArr);
+      sortedChildren.forEach((child) => this.renderNode(child, ul, level + 1, alignLeft));
       this.creatingDuringExpand = false;
 
       container.appendChild(ul);
 
+      // 展开高度动画并在合适时刻预热/播放条动画
       requestAnimationFrame(() => {
         const fullH = ul.scrollHeight;
         ul.style.maxHeight = `${fullH}px`;
         ul.style.opacity = "1";
+
+        // 计算预热时间（展开时）
+        const startOffset = Math.max(0, (this.settings.expandDuration || 0) - (this.settings.barPreheatExpandMs || DEFAULT_SETTINGS.barPreheatExpandMs));
+        const opId = ++this.currentOpId;
+        // 先延迟一小段时间再播放条展开动画（preheat）
+        const preheatTimer = window.setTimeout(() => {
+          if (opId !== this.currentOpId) return;
+          const descendants = this.collectDescendantFullPaths(node);
+          // 播放条伸展动画
+          this.playBarsExpand(descendants, opId).then(() => {
+            if (opId !== this.currentOpId) return;
+            this.rebuildOverlayBars();
+          });
+        }, startOffset);
+
         const onEnd = (e: TransitionEvent) => {
           if (e.propertyName === "max-height") {
             ul.style.maxHeight = "none";
             ul.removeEventListener("transitionend", onEnd);
+            clearTimeout(preheatTimer);
+            // 确保 overlay 同步
+            this.startOverlaySync(this.settings.expandDuration + 80);
           }
         };
         ul.addEventListener("transitionend", onEnd);
-
-        this.startOverlaySync(this.settings.expandDuration + 80);
       });
     }
+  }
+
+  private sortChildren(children: TagNode[]): TagNode[] {
+    const key = this.settings.sortBy;
+    const order = this.settings.sortOrder === "asc" ? 1 : -1;
+    const copy = children.slice();
+    copy.sort((a, b) => {
+      if (key === "count") {
+        const ca = a.count || 0;
+        const cb = b.count || 0;
+        if (ca === cb) return a.name.localeCompare(b.name);
+        return (ca - cb) * order;
+      } else {
+        const la = a.lastUsed || 0;
+        const lb = b.lastUsed || 0;
+        if (la === lb) return a.name.localeCompare(b.name);
+        return (la - lb) * order;
+      }
+    });
+    return copy;
   }
 
   private updateSubtreeRender(parentLi: HTMLElement, node: TagNode, level: number) {
     const opId = ++this.currentOpId;
 
+    // 如果已经有子 UL（收起逻辑）
     let siblingUl = parentLi.nextElementSibling;
     if (siblingUl && siblingUl.classList.contains("tag-tree-children")) {
+      // 折叠：先播放子条的收缩动画，再收起高度
       const descendants = this.collectDescendantFullPaths(node);
+      // 锁定子条当前 top 值，防止收起动画导致 overlay 跳动
       descendants.forEach(fp => {
         const selBar = `.tag-tree-view-bg-bar[data-fullpath="${escSelector(fp)}"]`;
         const barEl = this.barOverlay?.querySelector<HTMLElement>(selBar);
@@ -1039,8 +1097,10 @@ class TagTreeView extends ItemView {
         }
       });
 
-      const collapsePlayPromise = this.playBarsCollapse(descendants, opId);
+      // 播放子条收缩动画（以左为基点缩小）
+      const collapsePromise = this.playBarsCollapse(descendants, opId);
 
+      // 计算何时开始高度折叠：在 collapse 动画完成后或提前某个预热时间
       const collapseDur = Math.max(0, this.settings.barCollapseDuration || DEFAULT_SETTINGS.barCollapseDuration);
       const preheatCollapse = Math.max(0, this.settings.barPreheatCollapseMs || DEFAULT_SETTINGS.barPreheatCollapseMs);
       const heightStartAfter = Math.max(0, collapseDur - preheatCollapse);
@@ -1052,7 +1112,7 @@ class TagTreeView extends ItemView {
         current.style.maxHeight = `${full}px`;
         current.style.transitionDuration = `${this.settings.expandDuration}ms`;
         current.style.transitionTimingFunction = this.settings.expandEasing;
-        current.offsetHeight;
+        current.offsetHeight; // force reflow
         current.style.maxHeight = "0px";
         current.style.opacity = "0";
 
@@ -1060,11 +1120,13 @@ class TagTreeView extends ItemView {
           if (e.propertyName === "max-height") {
             current.removeEventListener("transitionend", onEnd);
             current.remove();
+            // 移除 overlay 中被折叠的子条（只移除受影响的）
             descendants.forEach(fp => {
               const selBar = `.tag-tree-view-bg-bar[data-fullpath="${escSelector(fp)}"]`;
               const b = this.barOverlay?.querySelector<HTMLElement>(selBar);
               if (b) b.remove();
             });
+            // 清除锁定 top 属性
             Array.from(this.barOverlay?.querySelectorAll<HTMLElement>(".tag-tree-view-bg-bar") || []).forEach(b => b.removeAttribute("data-locked-top"));
             this.rebuildOverlayBars();
           }
@@ -1072,6 +1134,7 @@ class TagTreeView extends ItemView {
         current.addEventListener("transitionend", onEnd);
       }, heightStartAfter);
 
+      // overlay 同步
       const syncDur = Math.max(this.settings.barCollapseDuration, this.settings.expandDuration) + 160;
       this.startOverlaySync(syncDur);
 
@@ -1079,6 +1142,7 @@ class TagTreeView extends ItemView {
       return;
     }
 
+    // 展开（插入子 ul）
     if (node.expanded && node.children.size > 0) {
       const treeRect = this.treeContainer!.getBoundingClientRect();
       const parentRect = parentLi.getBoundingClientRect();
@@ -1094,66 +1158,65 @@ class TagTreeView extends ItemView {
       ul.style.opacity = "0";
 
       this.creatingDuringExpand = true;
-      node.children.forEach((child) => this.renderNode(child, ul, level + 1, alignLeft));
+      const childrenArr = Array.from(node.children.values());
+      const sortedChildren = this.sortChildren(childrenArr);
+      sortedChildren.forEach((child) => this.renderNode(child, ul, level + 1, alignLeft));
       this.creatingDuringExpand = false;
 
       parentLi.parentElement!.insertBefore(ul, parentLi.nextSibling);
 
+      // 先 trigger 高度展开，再按 preheat 播放条动画
       requestAnimationFrame(() => {
         const full = ul.scrollHeight;
         ul.style.maxHeight = `${full}px`;
         ul.style.opacity = "1";
 
         const startOffset = Math.max(0, (this.settings.expandDuration || 0) - (this.settings.barPreheatExpandMs || DEFAULT_SETTINGS.barPreheatExpandMs));
-
-        const startBarsTimer = window.setTimeout(() => {
-          if (opId !== this.currentOpId) return;
+        const myOp = opId;
+        const preheatTimer = window.setTimeout(() => {
+          if (myOp !== this.currentOpId) return;
           const descendants = this.collectDescendantFullPaths(node);
-          this.playBarsExpand(descendants, opId).then(() => {
-            if (opId !== this.currentOpId) return;
+          this.playBarsExpand(descendants, myOp).then(() => {
+            if (myOp !== this.currentOpId) return;
+            // 在播放完成后确保 overlay 重建（清理 locked 属性）
             Array.from(this.barOverlay?.querySelectorAll<HTMLElement>(".tag-tree-view-bg-bar") || []).forEach(b => b.removeAttribute("data-locked-top"));
             this.rebuildOverlayBars();
           });
         }, startOffset);
 
         const onEnd = (e: TransitionEvent) => {
-          if (e.propertyName !== "max-height") return;
-          ul.removeEventListener("transitionend", onEnd);
-          clearTimeout(startBarsTimer);
-          if (opId !== this.currentOpId) return;
-          const descendants = this.collectDescendantFullPaths(node);
-          this.playBarsExpand(descendants, opId).then(() => {
-            if (opId !== this.currentOpId) return;
-            Array.from(this.barOverlay?.querySelectorAll<HTMLElement>(".tag-tree-view-bg-bar") || []).forEach(b => b.removeAttribute("data-locked-top"));
-            this.rebuildOverlayBars();
-          });
+          if (e.propertyName === "max-height") {
+            ul.removeEventListener("transitionend", onEnd);
+            clearTimeout(preheatTimer);
+            // 当高度动画完成时，确保 overlay 同步
+            this.startOverlaySync(this.settings.expandDuration + 80);
+          }
         };
         ul.addEventListener("transitionend", onEnd);
-
-        this.startOverlaySync(this.settings.expandDuration + 80);
       });
 
       if (this._idleReset) this._idleReset();
       return;
     }
 
+    // 兜底：重建 overlay
     this.rebuildOverlayBars();
     if (this._idleReset) this._idleReset();
   }
 
+  /* ---------- 背景条动画（扩展 / 收缩），确保以左为基点 ---------- */
   private async playBarsExpand(fullpaths: string[], opId: number): Promise<void> {
     if (!this.barOverlay) return;
     if (fullpaths.length === 0) return;
 
     const dur = Math.max(0, this.settings.barExpandDuration || DEFAULT_SETTINGS.barExpandDuration);
     const fade = Math.max(0, this.settings.barFadeInDuration || DEFAULT_SETTINGS.barFadeInDuration);
-    const total = Math.max(dur, fade) + 30;
+    const total = Math.max(dur, fade) + 40;
 
+    // 确保这些 bar 存在
     for (const fp of fullpaths) {
-      const sel = `.tag-tree-view-bg-bar[data-fullpath="${escSelector(fp)}"]`;
-      if (!this.barOverlay.querySelector(sel)) {
-        await this.createBarForFullpathWithRetry(fp, 6);
-      }
+      const selBar = `.tag-tree-view-bg-bar[data-fullpath="${escSelector(fp)}"]`;
+      if (!this.barOverlay.querySelector(selBar)) await this.createBarForFullpathWithRetry(fp, 6);
     }
 
     fullpaths.forEach(fp => {
@@ -1171,7 +1234,7 @@ class TagTreeView extends ItemView {
 
     this.startOverlaySync(total);
 
-    await new Promise<void>(resolve => {
+    await new Promise<void>((resolve) => {
       const start = performance.now();
       const tick = () => {
         if (opId !== this.currentOpId) { resolve(); return; }
@@ -1188,7 +1251,7 @@ class TagTreeView extends ItemView {
 
     const dur = Math.max(0, this.settings.barCollapseDuration || DEFAULT_SETTINGS.barCollapseDuration);
     const fade = Math.max(0, this.settings.barFadeOutDuration || DEFAULT_SETTINGS.barFadeOutDuration);
-    const total = Math.max(dur, fade) + 30;
+    const total = Math.max(dur, fade) + 40;
 
     fullpaths.forEach(fp => {
       const innerSel = `.tag-tree-view-bg-bar[data-fullpath="${escSelector(fp)}"] .bar-inner`;
@@ -1196,6 +1259,7 @@ class TagTreeView extends ItemView {
       if (inner) {
         inner.style.transition = `transform ${dur}ms ${this.settings.expandEasing}, opacity ${fade}ms linear`;
         inner.style.transformOrigin = "left center";
+        // 收缩以左为基点：scaleX(0) 从左侧消失
         inner.style.transform = "scaleX(0)";
         inner.style.opacity = "0";
       }
@@ -1203,7 +1267,7 @@ class TagTreeView extends ItemView {
 
     this.startOverlaySync(total);
 
-    await new Promise<void>(resolve => {
+    await new Promise<void>((resolve) => {
       const start = performance.now();
       const tick = () => {
         if (opId !== this.currentOpId) { resolve(); return; }
@@ -1221,17 +1285,18 @@ class TagTreeView extends ItemView {
     return res;
   }
 
+  /* ---------- rebuildOverlayBars：差异化重建、避免阻塞 ---------- */
   private rebuildOverlayBars() {
     if (!this.treeContainer || !this.barOverlay) return;
     const now = performance.now();
-    if (now - this.lastRebuildTime < 12) return;
+    if (now - this.lastRebuildTime < 8) return; // 限流
     this.lastRebuildTime = now;
 
-    const instantMode = now < this.overlayInstantUntil;
     const treeRect = this.treeContainer.getBoundingClientRect();
     const lisAll = Array.from(this.treeContainer.querySelectorAll<HTMLLIElement>("li.tag-tree-li"));
     const lis = lisAll.filter(li => li.getAttribute("data-removed") !== "1");
 
+    // 收集现有 bars
     const existingBars = new Map<string, HTMLElement>();
     Array.from(this.barOverlay.querySelectorAll<HTMLElement>(".tag-tree-view-bg-bar")).forEach(b => {
       const fp = b.getAttribute("data-fullpath") || "";
@@ -1243,10 +1308,11 @@ class TagTreeView extends ItemView {
       const li = lis[i];
       const fp = li.dataset.fullPath || "";
       const liRect = li.getBoundingClientRect();
-      const countEl = li.querySelector<HTMLElement>(".tag-tree-view-count");
+      const countEl = li.querySelector<HTMLElement>(".tag-tree-count");
       const count = countEl ? Number(countEl.textContent || "0") : 0;
 
       let alignLeft = liRect.left - treeRect.left;
+      // 寻找左侧第一个缩进更小的兄弟以对齐父条
       for (let j = i - 1; j >= 0; j--) {
         const candRect = lis[j].getBoundingClientRect();
         if (candRect.left < liRect.left - 0.5) { alignLeft = candRect.left - treeRect.left; break; }
@@ -1277,7 +1343,7 @@ class TagTreeView extends ItemView {
       const locked = bar.getAttribute("data-locked-top");
       if (locked !== null) {
         bar.style.transform = `translateY(${Number(locked)}px)`;
-        if (instantMode) {
+        if (performance.now() < this.overlayInstantUntil) {
           bar.style.transition = `left 0ms linear, width 0ms linear, background-color 0ms linear, transform 0ms linear`;
         } else {
           const dur = Math.max(200, this.settings.expandDuration);
@@ -1286,7 +1352,7 @@ class TagTreeView extends ItemView {
       } else {
         const top = liRect.top - treeRect.top;
         bar.style.transform = `translateY(${top}px)`;
-        if (instantMode) {
+        if (performance.now() < this.overlayInstantUntil) {
           bar.style.transition = `left 0ms linear, width 0ms linear, background-color 0ms linear, transform 0ms linear`;
         } else {
           const dur = Math.max(200, this.settings.expandDuration);
@@ -1311,6 +1377,7 @@ class TagTreeView extends ItemView {
       used.add(fp);
     }
 
+    // 移除多余 bars
     Array.from(this.barOverlay.querySelectorAll<HTMLElement>(".tag-tree-view-bg-bar")).forEach(b => {
       const fp = b.getAttribute("data-fullpath") || "";
       if (!used.has(fp)) b.remove();
@@ -1378,7 +1445,7 @@ class TagTreeView extends ItemView {
       }
     }
 
-    const countEl = li.querySelector<HTMLElement>(".tag-tree-view-count");
+    const countEl = li.querySelector<HTMLElement>(".tag-tree-count");
     const count = countEl ? Number(countEl.textContent || "0") : (this.tagCounts[fullpath] || 0);
 
     const containerClientWidth = this.treeContainer.clientWidth || (treeRect.right - treeRect.left);
@@ -1433,6 +1500,7 @@ class TagTreeView extends ItemView {
     return hexToRgb(cols[idx] || DEFAULT_SETTINGS.barColor1);
   }
 
+  /* ---------- 待机（Idle）相关：字体透明 & 背景条亮显 ---------- */
   private bindIdleEvents() {
     const reset = () => {
       if (this.idleTimeout) clearTimeout(this.idleTimeout);
@@ -1511,7 +1579,7 @@ class TagTreeView extends ItemView {
     flexes.forEach(f => (f.style.color = ""));
   }
 
-  // 修改点：搜索格式改为 `tag:#标签`，和官方一致（可匹配 frontmatter tags）
+  /* ---------- 搜索标签（改为 tag:#tag 以匹配 frontmatter） ---------- */
   openSearchWithTag(tag: string) {
     const leaves = this.app.workspace.getLeavesOfType("search");
     const query = `tag:#${tag}`;
@@ -1537,7 +1605,8 @@ class TagTreeView extends ItemView {
     }
   }
 
-  private handleSingleFileCacheChange(path: string, cacheTags: string[]) {
+  /* ---------- 单文件 cache 变更处理（差异化） ---------- */
+  private handleSingleFileCacheChange(path: string, cacheTags: string[], file?: TFile) {
     const old = this.perFileTagMap[path] || [];
     const oldSet = new Set(old);
     const newSet = new Set(cacheTags);
@@ -1552,19 +1621,20 @@ class TagTreeView extends ItemView {
       return;
     }
 
+    const mtime = file && file.stat && (file.stat.mtime || file.stat.mtime != null) ? (file.stat.mtime as unknown as number) : Date.now();
+
     for (const t of added) {
       const prev = this.tagCounts[t] || 0;
       this.tagCounts[t] = prev + 1;
+      this.tagLastUsed[t] = Math.max(this.tagLastUsed[t] || 0, mtime);
     }
     for (const t of removed) {
       const prev = this.tagCounts[t] || 0;
       const now = Math.max(0, prev - 1);
-      if (now === 0) delete this.tagCounts[t];
-      else this.tagCounts[t] = now;
+      if (now === 0) { delete this.tagCounts[t]; delete this.tagLastUsed[t]; } else this.tagCounts[t] = now;
     }
 
     this.perFileTagMap[path] = cacheTags;
-
     this.maxCount = Math.max(...Object.values(this.tagCounts), 1);
 
     if (added.length > 0) this.handleTagsAdded(added);
@@ -1574,29 +1644,116 @@ class TagTreeView extends ItemView {
     if (changed.length > 0) this.updateCountsAndBars(changed);
   }
 
-  buildTagTree(tagCounts: Record<string, number>): TagNode {
-    const root: TagNode = { name: "", fullPath: "", count: 0, children: new Map(), expanded: true };
-    for (const fullTag in tagCounts) {
-      const parts = fullTag.split("/");
-      let cur = root;
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        if (!cur.children.has(part)) {
-          cur.children.set(part, {
-            name: part,
-            fullPath: cur.fullPath ? `${cur.fullPath}/${part}` : part,
-            count: 0,
-            children: new Map(),
-            expanded: false,
-          });
+  /* ---------- 拖拽：立即生效，输出纯文本 "#tag" ---------- */
+  private attachDragHandlers(el: HTMLElement, fullpath: string) {
+    if ((el as any).__dragHandlersAttached) return;
+    (el as any).__dragHandlersAttached = true;
+
+    // 立即可拖拽
+    el.draggable = true;
+
+    el.addEventListener("dragstart", (e: DragEvent) => {
+      try {
+        const tagText = `#${fullpath}`; // 插入时只输出纯文本 #fullpath（无尾空格）
+        if (e.dataTransfer) {
+          e.dataTransfer.setData("text/plain", tagText);
+          e.dataTransfer.setData("application/x-tag", fullpath);
+          // 尝试设置拖拽图像（复制节点）
+          try {
+            const crt = el.cloneNode(true) as HTMLElement;
+            crt.style.position = "absolute";
+            crt.style.left = "-9999px";
+            document.body.appendChild(crt);
+            e.dataTransfer.setDragImage(crt, 8, 8);
+            setTimeout(() => crt.remove(), 50);
+          } catch (err) {
+            // ignore
+          }
         }
-        cur = cur.children.get(part)!;
-        if (i === parts.length - 1) cur.count = tagCounts[fullTag];
-      }
-    }
-    return root;
+      } catch (err) {}
+      el.classList.add("tag-tree-dragging");
+    });
+
+    el.addEventListener("dragend", (e: DragEvent) => {
+      el.classList.remove("tag-tree-dragging");
+    });
   }
 
+  /* ---------- 文档 drop 处理：支持 input/textarea/contenteditable/Obsidian 编辑器 ---------- */
+  private async handleDocumentDrop(e: DragEvent) {
+    if (!e.dataTransfer) return;
+    const tag = (e.dataTransfer.getData("application/x-tag") || "").trim();
+    const text = (e.dataTransfer.getData("text/plain") || "").trim();
+    if (!tag && !text) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // 使用落点优先策略：如果 drop 目标是在一个 input/textarea/contenteditable 元素上，
+    // 则把纯文本 "#fullpath" 插入到该输入的光标位置；否则插入到当前活动 Markdown 编辑器
+    const target = e.target as HTMLElement | null;
+    if (target) {
+      // 最近的 input 或 textarea
+      const inputEl = target.closest("input, textarea") as HTMLInputElement | HTMLTextAreaElement | null;
+      if (inputEl) {
+        try {
+          const insertion = text || `#${tag}`;
+          // 插入到当前光标位置（一些 third-party 输入框可能不支持 selectionStart）
+          const start = (inputEl.selectionStart ?? inputEl.value.length);
+          const end = (inputEl.selectionEnd ?? start);
+          const before = inputEl.value.slice(0, start);
+          const after = inputEl.value.slice(end);
+          inputEl.value = before + insertion + after;
+          inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+          inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+          return;
+        } catch (err) {
+          console.warn("插入到输入框失败：", err);
+        }
+      }
+
+      // contenteditable 区域（div[contenteditable=true] 等）
+      const editable = target.closest("[contenteditable='true']") as HTMLElement | null;
+      if (editable) {
+        try {
+          const insertion = text || `#${tag}`;
+          const sel = document.getSelection();
+          if (sel && sel.rangeCount > 0 && editable.contains(sel.anchorNode)) {
+            const range = sel.getRangeAt(0);
+            range.deleteContents();
+            const node = document.createTextNode(insertion);
+            range.insertNode(node);
+            // 将光标移动到插入之后
+            range.setStartAfter(node);
+            range.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            // 触发 input 事件
+            editable.dispatchEvent(new Event("input", { bubbles: true }));
+            return;
+          } else {
+            // fallback: append to editable
+            editable.appendChild(document.createTextNode(insertion));
+            editable.dispatchEvent(new Event("input", { bubbles: true }));
+            return;
+          }
+        } catch (err) {
+          console.warn("插入到 contenteditable 失败：", err);
+        }
+      }
+    }
+
+    // 否则插入到当前活动的 Markdown 编辑器（如果存在）
+    const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!mdView) return;
+    const editor = mdView.editor;
+    if (!editor) return;
+    const insertText = text || `#${tag}`;
+    editor.replaceSelection(insertText);
+    editor.focus();
+  }
+
+  /* ---------- 其余 small helpers ---------- */
   accumulateCounts(node: TagNode): number {
     if (node.children.size === 0) return node.count;
     let total = node.count;
@@ -1604,9 +1761,11 @@ class TagTreeView extends ItemView {
     node.count = total;
     return total;
   }
+
+  private collectDescendantFullPathsSimple(node: TagNode) { return this.collectDescendantFullPaths(node); }
 }
 
-/* utils */
+/* ---------- 帮助函数 ---------- */
 function arrayEqual(a: string[] | undefined, b: string[] | undefined) {
   if (!a && !b) return true;
   if (!a || !b) return false;
